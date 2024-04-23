@@ -1,0 +1,290 @@
+#!/usr/bin/env python
+"""
+Inputs a Joy messages and produces controls
+that match the control_interface
+"""
+import rospy
+import time
+import math
+from geometry_msgs.msg import PointStamped
+from std_msgs.msg import UInt8, Bool, String
+from sensor_msgs.msg import Joy
+from mmpug_msgs.msg import MMPUGModes
+from std_msgs.msg import String, Float32, Int8, UInt8, Bool, UInt32MultiArray, Int32
+
+class JoystickCommandSource():
+    def __init__(self):
+
+        # Axes for control
+        self.left_joystick_x = rospy.get_param("~left_joystick_x", 0)
+        self.left_joystick_y = rospy.get_param("~left_joystick_y", 1)
+        self.left_trigger = rospy.get_param("~left_trigger", 2)
+        
+        self.right_joystick_x = rospy.get_param("~right_joystick_x", 3)
+        self.right_joystick_y = rospy.get_param("~right_joystick_y", 4)
+        self.right_trigger = rospy.get_param("~joystick_x2_idx", 5)
+        
+        self.dpad_left_right = rospy.get_param("dpad_left_right", 6)
+        self.dpad_up_down = rospy.get_param("~dpad_up_down", 7)
+        
+        self.max_idx = max(
+            self.right_joystick_y,
+            self.right_trigger,
+            self.left_trigger,
+            self.left_joystick_x,
+            self.dpad_up_down,
+            self.right_joystick_x
+        )
+
+        # Buttons for control
+        self.a_button = rospy.get_param("~a_button", 0)
+        self.b_button = rospy.get_param("~b_button", 1)
+        self.x_button = rospy.get_param("~x_button", 2)
+        self.y_button = rospy.get_param("~y_button", 3)
+        self.lb_button = rospy.get_param("~lb_button", 4)
+        self.rb_button = rospy.get_param("~rb_button", 5)
+        self.back_button = rospy.get_param("~back_button", 6)
+        self.start_button = rospy.get_param("~start_button", 7)
+        self.xbox_button = rospy.get_param("~xbox_button", 8)
+        self.left_joystick_button = rospy.get_param("~left_joystick_button", 9)
+        self.right_joystick_button = rospy.get_param("~right_joystick_button", 10)
+        
+        self.max_button = max(
+            self.b_button,
+            self.y_button,
+            self.x_button,
+            self.a_button,
+            self.rb_button,
+            self.back_button,
+            self.start_button,
+            self.left_joystick_button,
+            self.right_joystick_button,
+            self.lb_button
+        )
+
+        self.authority_name = rospy.get_param("~authority_name", "local_joystick")
+
+        self.robot_iteration_deadband = rospy.get_param("~robot_iteration_deadband", 0.5)
+        self.exploration_trigger_debounce = rospy.get_param("~exploration_trigger_debounce", 5.)
+
+        self.iterationCallback = None
+        self.robot_iteration_triggered = False
+
+        # Arming
+        self.arm_button_pressed = False
+        self.system_arm_state_at_press = False
+        self.system_armed = False
+
+        # Exploration
+        self.exploration_button_pressed = False
+        self.exploration_button_press_time = 0.0
+
+        # Convoy
+        self.convoy_mode_change = 0
+
+
+        # System Feedback
+        # self.arm_state_sub = rospy.Subscriber("executive/armed", Bool, self.armedCallback)
+       # General
+        self.active_robot = None
+        self.target_speed = Float32()
+        self.target_speed.data = 2.0
+        self.speed_update_time = 0.0
+        self.speed_update_gap = 0.5
+        self.forming_up = False
+
+        self.joystick_x2_update = False
+        
+        # Joystick Context Mode and related variables to switch
+        self.JoyContextMode = 1 # 1 - Regular control mode, 0 - Mouse Mode
+        self.xbox_button_pressed = False
+        self.waypoint_plugin_active = False
+        
+        self.start_key_pressed = False
+        self.back_key_pressed = False
+        self.rb_pressed = False
+        self.lb_pressed = False
+        
+        self.a_btn_pressed = False
+        self.b_btn_pressed = False
+        self.x_btn_pressed = False
+        self.last_x_btn_time = None
+        self.restored_view = False
+        self.y_btn_pressed = False
+        self.right_js_pressed = False
+        self.left_js_pressed = False
+
+        
+        # Control Interface
+        self.authority_request_pub = rospy.Publisher("command/request_authority", String, queue_size=1)
+        self.joystick_pub = rospy.Publisher("%s/command/joy"%self.authority_name, Joy, queue_size=1)
+        self.state_pub = rospy.Publisher("%s/command/mode"%self.authority_name, UInt8, queue_size=1)
+        self.arm_pub = rospy.Publisher("%s/command/arm"%self.authority_name, Bool, queue_size=1)
+        self.explore_pub = rospy.Publisher("%s/command/enable_exploration"%self.authority_name, Bool, queue_size=1)
+        self.target_speed_pub = rospy.Publisher("/%s/command/target_speed"%self.authority_name, Float32, queue_size=1)
+        # Input
+        self.joystick_sub = rospy.Subscriber("joy", Joy, self.joyCallback)
+        self.formup_sub = rospy.Subscriber("bt/convoy_formup", Bool, self.formupCallback)
+        self.formed_up_sub = rospy.Subscriber("convoy_formed_up", Bool, self.formedUpCallback)
+
+    def run(self):
+        rospy.spin()
+
+    #def armedCallback(self, msg):
+        #print("armedCallback: ", msg.data)
+        #print("")
+        #self.system_armed = msg.data
+    
+    def formupCallback(self, msg):
+        self.forming_up = msg.data
+        
+    def formedUpCallback(self, msg):
+        self.forming_up = not msg.data
+
+    def joyCallback(self, msg):
+
+        #if self.active_robot is None:
+        #    rospy.logwarn_throttle(2, "No active robot, cannot project joystick commands.")
+        #    return
+
+        bad = False
+        if self.max_idx >= len(msg.axes):
+            rospy.logerr( "Joystick message does not have enough axes")
+            bad = True
+        if self.max_button >= len(msg.buttons):
+            rospy.logerr( "Joystick message does not have enough buttons")
+            bad = True
+
+        if bad:
+            return
+            
+        # Record Button States
+        joystick = msg.buttons[self.b_button]
+        exploration = msg.buttons[self.y_button]
+        waypoint = msg.buttons[self.x_button]
+        manual = msg.buttons[self.a_button]
+            
+        exploration_trigger = msg.buttons[self.y_button]
+            
+        arm_disarm = msg.buttons[self.rb_button]
+        lock_unlock = msg.buttons[self.lb_button]
+
+        convoy_down = msg.buttons[self.back_button]
+        convoy_up = msg.buttons[self.start_button]
+
+        target_speed_down = msg.buttons[self.left_joystick_button]
+        target_speed_up = msg.buttons[self.right_joystick_button]
+            
+        # Record Joystick/triggger states
+        speed_forward = msg.axes[self.right_joystick_y]
+        speed_forward2 = msg.axes[self.right_trigger]
+        speed_backward = msg.axes[self.left_trigger]
+        steering_val = msg.axes[self.left_joystick_x]
+
+        #sideways_speed = msg.axes[self.right_joystick_x]
+        sideways_speed = 0
+        
+        robot_iteration = msg.axes[self.dpad_up_down]
+
+        control_trigger_a = msg.axes[self.left_trigger] < 0.0
+        control_trigger_b = msg.axes[self.right_trigger] < 0.0
+
+            
+        self.convoy_mode_change = 0
+        if convoy_up:
+            self.convoy_mode_change = 1
+        elif convoy_down:
+            self.convoy_mode_change = -1
+            
+        if self.forming_up:
+            self.target_speed_pub.publish(Float32(1.5))
+        elif math.fabs(time.time() - self.speed_update_time) > self.speed_update_gap:
+            if target_speed_up:
+                self.target_speed.data += 0.5
+            elif target_speed_down:
+                self.target_speed.data -= 0.5
+            if target_speed_up or target_speed_down:
+                self.speed_update_time = time.time()
+                self.target_speed.data = max(self.target_speed.data, 0.0)
+            self.target_speed_pub.publish(self.target_speed)
+
+        # Multiple modes to drive in joystick
+        speed_forward2 = (1.0 - speed_forward2) / 2
+        if speed_forward2 == 0.0:
+            speed_forward2 = -(1.0 - speed_backward) / 2
+        if abs(speed_forward2) > abs(speed_forward):
+            speed_forward = speed_forward2
+
+        joystick_msg = Joy()
+        joystick_msg.axes = [speed_forward, steering_val, sideways_speed]
+        
+        #Todo test delay
+        #if(steer)
+        #print("send cmd time: ", rospy.Time.now())
+        
+        joystick_msg.header.stamp = rospy.Time.now()
+        self.joystick_pub.publish(joystick_msg)
+        
+        # Handle the control triggered (to request authority)
+        if control_trigger_a and control_trigger_b:
+            rospy.loginfo_throttle(1., "Requesting control authority.")
+            authority_request_msg = String()
+            authority_request_msg.data = self.authority_name
+            self.authority_request_pub.publish(authority_request_msg)
+                    
+        # Handle triggering exploration
+        if exploration_trigger:
+            if not self.exploration_button_pressed:
+                rospy.loginfo("Starting exploration trigger.")
+                self.exploration_button_press_time = time.time()
+            if math.fabs(time.time() - self.exploration_button_press_time) > self.exploration_trigger_debounce:
+                rospy.loginfo_throttle(1., "Triggering exploration")
+                exploration_trigger_msg = Bool()
+                exploration_trigger_msg.data = True
+                self.explore_pub.publish(exploration_trigger_msg)
+            self.exploration_button_pressed = True
+        else:
+            self.exploration_button_pressed = False
+
+        # Handle arming / disarming
+        #print("system_armed: ",self.system_armed)
+        if arm_disarm:
+            #print("system_armed: ", self.system_armed)
+            #print("arm_button_pressed: ", self.arm_button_pressed)
+            if not self.arm_button_pressed:
+                self.arm_button_pressed = True
+                rospy.loginfo_throttle(0.1, "Attempting to %s"%("arm" if not self.system_armed else "disarm"))
+                self.system_armed  = not self.system_armed
+        else:
+            if self.arm_button_pressed:
+                arm_msg = Bool()
+                arm_msg.data = self.system_armed 
+                #print("arm_msg: ",arm_msg)
+                self.arm_pub.publish(arm_msg)
+                self.arm_button_pressed = False
+
+        # Request State changing
+        mode_request_msg = UInt8()
+        valid_request = True
+        if manual:
+            rospy.loginfo_throttle(1., "Requesting manual mode.")
+            mode_request_msg.data = MMPUGModes.MANUAL_MODE
+        elif joystick:
+            rospy.loginfo_throttle(1., "Requesting joystick mode.")
+            mode_request_msg.data = MMPUGModes.JOYSTICK_MODE
+        elif exploration:
+            rospy.loginfo_throttle(1., "Requesting exploration mode.")
+            mode_request_msg.data = MMPUGModes.EXPLORATION_MODE
+        elif waypoint:
+            rospy.loginfo_throttle(1., "Requesting waypoint mode.")
+            mode_request_msg.data = MMPUGModes.WAYPOINT_MODE
+        else:
+            valid_request = False
+        if valid_request:
+            self.state_pub.publish(mode_request_msg)
+
+
+if __name__ == "__main__":
+    rospy.init_node("joystick_command_source")
+    node = JoystickCommandSource()
+    node.run()
